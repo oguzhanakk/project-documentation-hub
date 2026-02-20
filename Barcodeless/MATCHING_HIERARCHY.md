@@ -354,6 +354,245 @@ TOPLAM SİLİNEN:            -617 (-0.36%)
 
 ---
 
+## 📋 Preprocessing (Ön İşleme)
+
+Eşleştirme başlamadan önce her iki tabloya da şu dönüşümler uygulanır:
+
+| Alan | Dönüşüm |
+|------|---------|
+| `brand_name` | `lowercase + strip` |
+| `product_content_name` | `lowercase + strip` |
+| `size` | BQ sorgusunda `LOWER(TRIM(size))` — http linkler, `-`, `null`, boş değerler → NULL |
+| `brand_name` (özel) | BQ sorgusunda: `Trendyolmilla` → `TRENDYOLMİLLA`, `bilinmiyor` → NULL, `diğer` → `Diğer`, `Pull*` → `Pull & Bear` |
+
+Ayrıca Google Sheets'ten dinamik okunan **blacklist** `integration_code`'ları package tablosundan filtrelenir ve hiçbir stratejiyle eşleştirmeye dahil edilmez.
+
+### Veri Kaynakları
+
+| Tablo | İçerik | Anahtar Alan |
+|-------|--------|--------------|
+| `warehouse_base_v2` | Depodaki fiziksel ürünler | `kbarcode` |
+| `package_base_v1` | Sipariş paketleri | `integration_code` |
+
+---
+
+## 🔍 Fuzzy Matching Detay: Aday Filtreleme ve Threshold'lar
+
+Production'da binlerce warehouse × yüz binlerce package olduğu için her paketi her warehouse ile karşılaştırmak çok yavaş olur. Bu yüzden önce adaylar daraltılır:
+
+### Aday Filtreleme
+
+- Her paket için, sadece **brand ilk 3 karakter** VEYA **SKU ilk 3 karakter** eşleşen warehouse kayıtları aday olarak seçilir
+- Maksimum **200 aday** ile sınırlanır
+- Aday bulunamazsa tüm warehouse havuzu kullanılır
+- `9999` ile başlayan SKU'lar için sadece **brand-only filtreleme** uygulanır
+
+### Threshold Tablosu
+
+| Parametre | Değer | Açıklama |
+|-----------|-------|----------|
+| `brand_threshold` | 85 | Brand benzerlik skoru minimum %85 |
+| `content_threshold` | 85 | Content benzerlik skoru minimum %85 |
+| `sku_fuzzy_threshold` | 60 | SKU3+content için content minimum %60 |
+| `levenshtein_threshold` | 20 | SKU3+content için brand Levenshtein mesafesi max 20 |
+
+### Fuzzy Kurallar (Öncelik Sırasıyla)
+
+**Kural 1 — SKU Startswith:**
+
+```
+wh_sku == pkg_sku
+VEYA wh_sku.startswith(pkg_sku)
+VEYA pkg_sku.startswith(wh_sku)
+```
+
+`9999` ile başlayan SKU'lar için bu kural **atlanır**.
+
+**Kural 2 — Brand + Content Fuzzy:**
+
+```
+fuzz.ratio(wh_brand, pkg_brand) >= 85
+VE fuzz.ratio(wh_content, pkg_content) >= 85
+```
+
+Birden fazla aday varsa en yüksek content skoru olan seçilir.
+
+**Kural 3 — Content-Only Fuzzy:**
+
+```
+fuzz.ratio(wh_content, pkg_content) > 85
+```
+
+Brand eşleşmese bile content tek başına yeterince benzerse eşleşme yapılır.
+
+**Kural 4 — SKU3 + Content + Levenshtein:**
+
+```
+wh_sku[:3] == pkg_sku[:3]                   (SKU ilk 3 karakter aynı)
+VE fuzz.ratio(wh_content, pkg_content) > 60  (content %60+ benzer)
+VE Levenshtein(wh_brand, pkg_brand) <= 20    (brand mesafesi max 20)
+```
+
+`999` ile başlayan SKU'lar için bu kural da **atlanır**.
+
+---
+
+## 🔗 Link Matching Detay: URL Parsing
+
+**URL formatı:** `https://www.trendyol.com/.../urun-adi-p-12345?v=VARIANT`
+
+**ID çıkarma kuralları:**
+- `-p-(\d+)` regex ile product ID alınır (örnek: `-p-12345` → `12345`)
+- `?v=xxx` varsa variant bilgisi eklenir → `12345_v_xxx`
+- İki tarafta da aynı product ID varsa eşleşme yapılır
+
+**Tekilleştirme:** Aynı kbarcode birden fazla paket ile eşleşirse, `last_occurrence_datetime`'a göre en eski tarihli paket seçilir.
+
+---
+
+## 🤖 AI Matching Detay: Kategori Bazlı Similarity
+
+ADIM 5'teki AI Matching, `ai_analysis_cache_temp` tablosundaki `enhanced_signature` verisini kullanarak kategori bazlı benzerlik hesaplar.
+
+### Similarity Formülü
+
+```
+overall_similarity = (
+    critical_rate    × 0.60 +   -- Kritik alanlar (kategori, tip, renk, cinsiyet vb.)
+    important_rate   × 0.25 +   -- Önemli alanlar (marka, malzeme, boyut vb.)
+    optional_rate    × 0.10 +   -- Opsiyonel alanlar (desen, stil vb.)
+    signature_sim    × 0.05     -- Enhanced signature benzerlik
+)
+```
+
+### Kategori-Özel Kritik Alanlar
+
+| Kategori | Kritik Alanlar |
+|----------|---------------|
+| Giyim | kategori, tip, renk, cinsiyet, giyim_uzunluk, giyim_kesim |
+| Kozmetik | kategori, tip, kozmetik_adet, uygulama_alani |
+| Elektronik | kategori, tip, elektronik_adet, model_numarasi |
+| Ayakkabı | kategori, tip, cinsiyet, ayakkabi_tipi, topuk_yuksekligi |
+| Gıda | kategori, tip, gida_adet, gida_tipi |
+| Kitap | kategori, tip, kitap_isim, kitab_yazar |
+
+**Universal kritik alanlar (tüm kategoriler):** `hacim`, `agirlik`, `adet_sayisi` — bunlar eşleşmediği durumda direkt **red**.
+
+**Minimum threshold:** `overall_similarity >= 30%` olan eşleşmeler `ai_verification_cache` tablosuna yazılır.
+
+---
+
+## ✅ Kalite Filtreleri (Post-Processing)
+
+ADIM 1-4'ün birleştirilen sonuçlarına 3 kalite filtresi sırayla uygulanır. Bu filtreler **ADIM 5-6 ve Trendyol link eşleştirmelerinden muaftır**.
+
+Filtreler `services/matching/post_processing.py` içindeki `apply_quality_filters()` fonksiyonunda uygulanır.
+
+### Filtre 1: Tam Paket Kontrolü
+
+```
+matched_count == package_count
+```
+
+Bir pakette N ürün varsa (`package_count=N`), o `integration_code`'a tam N tane farklı `kbarcode` eşleşmiş olmalıdır.
+
+**Örnek:** Pakette 3 ürün var ama sadece 2'si eşleşti → bu paket **elenir**.
+
+### Filtre 2: Aynı Lokasyon Kontrolü
+
+```
+location_count == 1
+```
+
+Bir `integration_code`'a eşleşen tüm `kbarcode`'lar aynı depo lokasyonunda (`location_wh`) olmalıdır. Farklı lokasyonlardan gelen eşleşmeler **elenir**.
+
+**Örnek:** IC-001'e eşleşen 3 kbarcode var, 2'si A lokasyonunda, 1'i B lokasyonunda → tüm IC-001 eşleşmesi **elenir**.
+
+### Filtre 3: Tekil Eşleştirme
+
+```
+1 kbarcode → 1 integration_code
+```
+
+Her `kbarcode` sadece 1 `integration_code` ile eşleşebilir. Birden fazla eşleşme varsa, `match_rule`'a göre sıralanır ve en yüksek öncelikli kalan kalır (duplikatsızlaştırma).
+
+### Filtre Akışı
+
+```
+Tüm eşleştirme sonuçları (SKU + Link + Exact + Fuzzy)
+    │
+    ├─ Trendyol link eşleştirmeleri → MUAF (direkt final sonuca)
+    │
+    └─ Diğer eşleştirmeler
+         │
+         ├─ Filtre 1: Tam Paket (matched_count == package_count) → elenenler çıkar
+         │
+         ├─ Filtre 2: Aynı Lokasyon (tek lokasyon) → elenenler çıkar
+         │
+         └─ Filtre 3: Tekil Eşleştirme (1 kbarcode → 1 IC) → duplikatsızlaştır
+              │
+              └─ Final sonuç → missing_packages_match'e kaydet
+```
+
+---
+
+## 📚 Historic Tablo Yönetimi
+
+Eşleştirme sonuçları üç tabloda yönetilir:
+
+### 1. `missing_packages_match` (Truncate-Insert)
+
+Her çalıştırmada **truncate** edilir ve o çalıştırmanın sonuçları yazılır. Source değerleri:
+
+| Source | Kaynak |
+|--------|--------|
+| `sku_matching` | ADIM 1 |
+| `link_matching` | ADIM 2 |
+| `exact_matching` | ADIM 3 |
+| `fuzzy_matching` | ADIM 4 |
+| `ai_matching` | ADIM 5+6 (AYNI/KESIN_AYNI olanlar) |
+
+### 2. `missing_packages_match_historic` (Versiyon Kontrolü)
+
+Geçmiş eşleştirmeleri `is_current` flag ile yönetir:
+
+1. Yeni çalıştırma başladığında → Tüm `is_current=true` kayıtları `is_current=false` yapılır
+2. Her eşleşme için:
+   - Daha önce **görülmüş** → Sadece `is_current=true` yapılır (`data_date` **değişmez** — ilk görülme tarihi korunur)
+   - **Görülmemiş** → Yeni kayıt eklenir (`is_current=true`, bugünün tarihi)
+
+### 3. `ai_verification_cache` (AI Doğrulama)
+
+AI eşleştirme ve doğrulama sonuçlarını tutar:
+
+1. İlk eşleştirme → `similarity_score` hesaplanır
+2. Score >= 50 olanlar → AI verification için Trendyol AI'a gönderilir
+3. Sonuçlar (AYNI, KESIN_AYNI, FARKLI) güncellenir
+4. AYNI veya KESIN_AYNI olanlar → `missing_packages_match`'e transfer edilir
+
+---
+
+## ⚠️ Özel Durumlar ve Kurallar
+
+### 9999 SKU Kuralı
+
+`9999` ile başlayan SKU'lar marketplace ürünleridir. Bu ürünler için:
+- Fuzzy ADIM 4'te **SKU startswith** kuralı atlanır
+- Fuzzy ADIM 4'te **SKU3 + content** kuralı atlanır
+- Aday filtrelemede sadece **brand-only filtreleme** uygulanır (brand ilk 3 karakter)
+
+### Trendyol Link Muafiyeti
+
+Trendyol link eşleştirmeleri (`match_rule = "Trendyol ürün ID ile eşleştirme"`):
+- Kalite filtrelerinden **muaf** tutulur
+- Product ID bazlı olduğu için %100 güvenilir kabul edilir
+
+### Blacklist
+
+Google Sheets'ten dinamik okunan `integration_code` listesi. Bu kodlar package tablosundan **filtrelenir** ve hiçbir stratejiyle eşleştirmeye dahil edilmez.
+
+---
+
 ## 🎯 Hangi Match Rule Kullanmalıyım?
 
 ### Raporlama İçin Güvenilirlik Sıralaması:
