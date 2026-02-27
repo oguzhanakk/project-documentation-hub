@@ -63,11 +63,23 @@ Pipeline her çalıştığında tüm dataları baştan işliyordu. 1. testte do�
 - Hatalı olan 1300 eşleşmede aynı yanlış sonucu değil, farklı/doğru bir eşleşme araması
 
 **Ne yapıldı:**
-Eşleşme tablosuna "doğrulanmış mı?" alanı eklendi. 1. testten sonra 910 doğru eşleşme "evet", 1300 hatalı eşleşme "hayır" olarak işaretlendi. Pipeline artık "evet" olanlara hiç bakmıyor, "hayır" olanlarda ise aynı yanlış eşleşmeyi bloke edip farklı bir eşleşme arıyor.
+Eşleşme tablosuna `match_verified` alanı eklendi. Saha ekibinin kontrol sonuçlarına göre:
+- 1. testten sonra 910 doğru eşleşme → `match_verified='yes'`
+- 1. testten sonra 1300 hatalı eşleşme → `match_verified='no'`
+- 3. testte ek olarak 225 doğru + 153 hatalı eşleşme daha işaretlendi (BigQuery `hatali_eslestirmeler` tablosundan, %50 kuralına takılanlar hariç — çünkü %50 elenmeleri eşleştirmenin kendisiyle değil paket büyüklüğüyle ilgili)
+
+Pipeline davranışı:
+
+| match_verified | Pipeline davranışı |
+|---|---|
+| `yes` | Kbarcode warehouse'dan çıkarılır, **hiç işlenmez** — mevcut eşleşme korunur |
+| `no` | Kbarcode işlenir ama aynı (kbarcode, IC) çifti **engellenir** — farklı eşleşme aranır |
+| `NULL` | Normal işlenir |
 
 **Ne bekliyoruz:**
 - Doğrulanmış eşleşmeler atlanıyor → daha hızlı çalışma
 - Hatalı eşleşmeler tekrar deniyor ama aynı yanlış çift bloke → farklı bir eşleşme gelirse kaydediliyor
+- Her test döngüsünde saha ekibinin geri bildirimi sisteme giriyor → kümülatif iyileşme
 
 ---
 
@@ -180,3 +192,301 @@ Aynı pembe makyaj organizeri ama imzalar tamamen farklı çıkıyor → eşleş
 
 **Durum:**
 Henüz geliştirme yapılmadı. Bu alan en karmaşık kısım — false positive riski ile eşleşme kaybı arasında denge kurulması gerekiyor. Ek koşullar ve kurallar üzerinde çalışılması gerekiyor.
+
+---
+---
+
+# 2. Test 2. Gün Sonrası Geliştirmeler (26.02.2026)
+
+> **Kaynak:** 2. test çalıştırması sonrası saha ekibi (Burak) tarafından iletilen "%50 kuralına uymuyor" geri bildirimi
+> **Tespit:** 63 gönderide %50 kuralına uymasına rağmen kayıtlar historic tabloya yazılmıştı
+
+---
+
+## 8. %50 Filtre Sırası Hatası (Kritik Bug Fix)
+
+**Ne oldu:**
+2. test sonuçlarında 63 gönderi "%50 kuralına uymuyor" olarak işaretlendi. İncelediğimizde bu kayıtların pipeline tarafından elenmesi gerektiği halde DB'ye yazıldığını gördük.
+
+**Neden oldu:**
+Kalite filtrelerinin uygulama sırası yanlıştı. %50 filtresi **Tekil Eşleştirme filtresinden ÖNCE** çalışıyordu. Bu da `matched_count` (eşleşen kbarcode sayısı) hesaplamasını şişiriyordu.
+
+**Somut örnek:**
+Gönderi `7330025197779000` — Siveno markasının 5 farklı ürün içeren bir paketi:
+
+| Adım | Açıklama |
+|------|----------|
+| 1. SKU Matching | Paketin 4 farklı SKU'su var. Warehouse'da bu SKU'lardan 3 farklı kbarcode eşleşti |
+| 2. matched_count = 3 | %50 filtresi: 3 ≥ 5×0.5 = 2.5 → **GEÇTİ** |
+| 3. Tekil Eşleştirme | O 3 kbarcode'dan 2'si başka gönderilere atandı → geriye **1 kbarcode** kaldı |
+| 4. Sonuç | DB'de 1 kbarcode ile kayıt var ama gerçek oran %20 (1/5) — elenmesi gerekirdi |
+
+**Problem:** `matched_count` Tekil Eşleştirme'den önce hesaplandığı için şişik kalıyordu. Aynı SKU'ya sahip birden fazla kbarcode pipeline'da ilk etapta eşleşiyor ama sonra Tekil Eşleştirme sırasında başka gönderilere dağılıyordu. %50 filtresi bu dağılımdan habersiz eski (şişik) sayıyla karar veriyordu.
+
+**Ne yapıldı:**
+Kalite filtrelerinin uygulama sırası değiştirildi:
+
+| Eski Sıra | Yeni Sıra |
+|-----------|-----------|
+| 1. %50 product_count filtresi | 1. Lokasyon filtresi (aynı lokasyonda mı?) |
+| 2. Lokasyon filtresi | 2. Tekil Eşleştirme (1 kbarcode → 1 gönderi) |
+| 3. Tekil Eşleştirme | 3. %50 product_count filtresi **(Tekil sonrası gerçek sayıyla)** |
+
+Artık `matched_count` Tekil Eşleştirme **sonrası** hesaplanıyor. Bu sayede her gönderiye gerçekten atanan kbarcode sayısı üzerinden %50 kontrolü yapılıyor.
+
+**Aynı örnek yeni sırayla:**
+
+| Adım | Açıklama |
+|------|----------|
+| 1. Lokasyon filtresi | Geçti |
+| 2. Tekil Eşleştirme | 3 kbarcode'dan 2'si başka gönderilere atandı → bu gönderi için **1 kbarcode** |
+| 3. matched_count = 1 | %50 filtresi: 1 < 2.5 → **ELENDİ** ✅ |
+
+**Ne bekliyoruz:**
+- Daha önce yanlışlıkla geçen 63 benzeri kayıt artık doğru şekilde elenecek
+- %50 kuralı gerçek eşleşme sayısını yansıtacak, şişik sayılarla karar verilmeyecek
+- Hem production pipeline hem de diagnose endpoint aynı doğru sırayla çalışıyor
+
+---
+
+## 9. Akıllı Tekil Eşleştirme (Eşleşme Oranını Artırma)
+
+**Ne oldu:**
+Bir kbarcode birden fazla gönderiyle (integration_code) eşleştiğinde, sistem hangi gönderiyi seçeceğine `match_rule` alanının **alfabetik sıralaması** ile karar veriyordu. Bu tamamen rastgele bir seçimdi — ürün içeriğine göre eşleştirme, SKU eşleştirmesinden önce geliyordu çünkü "p" harfi "🔑" emojisinden önce sıralanıyordu. Eşleştirme güvenilirliği ve paket büyüklüğü hiç dikkate alınmıyordu.
+
+**Neden yapıldı:**
+Aynı kbarcode hem 3 ürünlü küçük bir paketle hem 15 ürünlü büyük bir paketle eşleşebiliyor. Eski mantıkta rastgele biri seçiliyordu. Oysa büyük pakete yönlendirmek, toplam eşleşme sayısını artırabilir — çünkü büyük paketin %50 kuralını geçmesi için daha çok kbarcode'a ihtiyacı var ve her ek kbarcode daha fazla toplam eşleşme koruyor.
+
+**Somut örnek:**
+
+Kbarcode `K177xxx` hem IC-A (3 ürünlü paket, 1 eşleşme) hem IC-B (15 ürünlü paket, 9 eşleşme) ile eşleşiyor:
+
+| Senaryo | IC-A (3 ürün) | IC-B (15 ürün) | Toplam korunan |
+|---------|---------------|----------------|----------------|
+| **Eski:** Rastgele → IC-A | 2/3=%67 GEÇTİ | 9/15=%60 GEÇTİ | 11 kayıt |
+| **Yeni:** Büyük paket → IC-B | 1/3=%33 ELENDİ | 10/15=%67 GEÇTİ | 10 kayıt |
+
+Bu örnekte fark küçük, ama asıl kazanç şu senaryoda:
+
+| Senaryo | IC-A (2 ürün) | IC-B (20 ürün, 9 eşleşme) | Toplam korunan |
+|---------|---------------|---------------------------|----------------|
+| **Eski:** Rastgele → IC-A | 1/2=%50 GEÇTİ (1 kayıt) | 9/20=%45 ELENDİ (0 kayıt) | **1 kayıt** |
+| **Yeni:** Büyük paket → IC-B | 0/2=%0 ELENDİ (0 kayıt) | 10/20=%50 GEÇTİ (10 kayıt) | **10 kayıt** |
+
+Kbarcode IC-B'ye giderek 10 eşleşme kurtarılıyor, IC-A'ya gitseydi sadece 1 eşleşme korunacaktı.
+
+**Ne yapıldı:**
+Tekil Eşleştirme mantığı tamamen değiştirildi. Artık 1 kbarcode birden fazla IC ile eşleştiğinde 3 aşamalı akıllı seçim yapılıyor:
+
+| Öncelik | Kriter | Açıklama |
+|---------|--------|----------|
+| 1 | **%50 uygunluğu** | %50 kuralına uyan IC tercih edilir |
+| 2 | **product_count (büyük paket)** | Daha fazla ürün içeren pakete yönlendirilir |
+| 3 | **match_rule güvenilirliği** | Link > SKU > Exact > Fuzzy sıralaması |
+
+Ayrıca `match_rule` öncelik sıralaması da düzeltildi — eskiden alfabetik sıralama kullanılıyordu (yanlış), artık mantıksal güvenilirlik sıralaması kullanılıyor:
+
+| Öncelik | Eşleştirme Yöntemi |
+|---------|--------------------|
+| 0 (en güvenilir) | Trendyol Link |
+| 1-3 | SKU eşleştirmeleri |
+| 4-6 | İçerik bazlı (Exact) eşleştirmeler |
+| 99 | Fuzzy eşleştirmeler |
+
+**Ne bekliyoruz:**
+- Kbarcode'lar en verimli pakete yönlendirilecek → toplam eşleşme sayısı artacak
+- Büyük paketlerin %50 kuralını geçme şansı artacak (her ek kbarcode orada daha değerli)
+- Eşleştirme güvenilirlik sıralaması artık doğru (SKU > Exact > Fuzzy, alfabetik değil)
+
+---
+
+## 10. Kalite Filtresi Elenme Kaydı + Retry Mekanizması
+
+**Ne oldu:**
+Kalite filtrelerinde (%50 kuralı, lokasyon, tekil eşleştirme) elenen kbarcode'lar tamamen kaybediliyordu. Cleanup'ta silinen eşleştirmeler `analysis_results` tablosuna yazılıyordu ama filtre elenmeleri hiçbir yere kaydedilmiyordu. Bu durumda:
+
+1. Bir kbarcode bir gönderiyle eşleşti ama %50 kuralına takıldı → elendi ve kayboldu
+2. Belki başka bir gönderiyle eşleşebilirdi ama tekrar denenme şansı yoktu
+3. Cleanup'ta silinen bir eşleştirme, o kbarcode'un başka bir gönderiyle eşleşme olasılığını da yok ediyordu
+
+**Neden yapıldı:**
+Eşleştirme pipeline'ı sıralı çalışıyor: önce eşleştir → sonra filtrele → sonra cleanup yap. Bu süreçte her eleme "nihai" kabul ediliyordu. Oysa elenen bir kbarcode'un başka bir gönderiyle eşleşme ihtimali var — ama bu ihtimal hiç denenemiyor, çünkü kbarcode kaybolmuş oluyor.
+
+**Ne yapıldı:**
+
+**a) Filtre elenme kaydı:**
+Kalite filtrelerinde elenen her `(kbarcode, integration_code)` çifti artık `analysis_results` tablosuna yazılıyor:
+
+| problem_status | Açıklama |
+|---------------|----------|
+| `FILTER_LOCATION` | Farklı lokasyondan eşleşme (aynı gönderinin kbarcode'ları farklı lokasyonlarda) |
+| `FILTER_TEKIL` | Tekil eşleştirmede başka gönderi tercih edildi |
+| `FILTER_50_PERCENT` | %50 ürün sayısı kuralına uymuyor |
+
+**b) Retry endpoint (`/matching/retry`):**
+Yeni bir endpoint oluşturuldu. Bu endpoint:
+
+1. `analysis_results`'tan tüm elenen/silinen kbarcode'ları toplar (hem filtre elenmeleri hem cleanup silmeleri)
+2. Hâlâ `is_current=true` eşleşmesi olanları çıkarır (zaten eşleşmiş, tekrar gerek yok)
+3. Eski yanlış eşleştirmeleri engeller — aynı `(kbarcode, integration_code)` çifti tekrar gelmez
+4. `match_verified='no'` çiftlerini de engeller
+5. Kalan kbarcode'lar için tam eşleştirme pipeline'ını çalıştırır (SKU → Link → Exact → Fuzzy)
+6. Aynı kalite filtrelerini uygular (lokasyon, tekil, %50)
+7. Yeni eşleştirmeleri hem `missing_packages_match`'e hem `historic`'e kaydeder (incremental — mevcut kayıtlara dokunmadan)
+8. Başarılı retry'ların eski filtre kayıtlarını `analysis_results`'tan temizler
+
+**Somut örnek:**
+
+| Adım | Açıklama |
+|------|----------|
+| 1. Enhanced pipeline | K177xxx → IC-A ile eşleşti (SKU matching) |
+| 2. %50 filtresi | IC-A'nın 10 ürünü var, sadece 2 eşleşme → %20 < %50 → **ELENDİ** |
+| 3. analysis_results'a yazıldı | `problem_status='FILTER_50_PERCENT'`, K177xxx + IC-A kaydedildi |
+| 4. Retry çalıştı | K177xxx tekrar pipeline'a sokuldu, IC-A engellendi |
+| 5. Yeni eşleşme | K177xxx → IC-B ile eşleşti (Exact matching, 3 ürünlü paket, 2 eşleşme → %67 GEÇTİ) |
+| 6. Sonuç | K177xxx artık IC-B ile historic'te `is_current=true` |
+
+**Ne bekliyoruz:**
+- Filtrelerde ve cleanup'ta kaybedilen kbarcode'lar ikinci bir şans alıyor
+- Aynı yanlış eşleştirme tekrarlanmıyor (rejected pairs mekanizması)
+- Toplam eşleşme sayısı artacak — özellikle %50 kuralına takılan ama başka gönderilerle eşleşebilecek kbarcode'lar için
+- Pipeline'ın "tek geçişlik" sınırı aşılıyor, daha kapsamlı eşleştirme sağlanıyor
+
+---
+---
+
+# 3. Son Durum ve Açık Kaygılar (27.02.2026)
+
+> **Kaynak:** 3. test çalıştırması sonrası pipeline analizi ve [manuel eşleştirme karşılaştırma sheeti](https://docs.google.com/spreadsheets/d/17iK4JHgf9sGgFpSyJNom78hJledZ1pwcMlIfRd1jNdc/edit?gid=1031814373#gid=1031814373)
+> **Durum:** Pipeline çalışıyor, filtreler doğru çalışıyor, retry mekanizması aktif. Ancak yapısal sınırlar ve kaynak veri kalitesi nedeniyle çözülemeyen durumlar var.
+
+---
+
+## 11. Tekli Ürün → Çoklu Paket Eşleştirme Sorunu (1→10 Problemi)
+
+**Ne oldu:**
+Manuel eşleştirme ekibi, aynı gönderiyle (integration_code) 10 ayrı tekli kbarcode'u eşleştirmiş. Ama bu 10 kbarcode warehouse'da bağımsız tekli ürünler olarak duruyor — aralarında bir "grup" ilişkisi yok.
+
+**Somut örnek:**
+Gönderi `7330028521871791` — Fureya markasının "Karışık Renkli 10 Adet Flamlı Pamuk Eşarp" paketi:
+
+| Kbarcode | Warehouse İçeriği | Paket İçeriği |
+|----------|-------------------|---------------|
+| K1771611813617 | Selin - Düz Renk Tülbent Yazma | Fureya - Karışık Renkli 10 Adet Flamlı Pamuk Eşarp |
+| K1771611813787 | Selin - Düz Renk Tülbent Yazma | Fureya - Karışık Renkli 10 Adet Flamlı Pamuk Eşarp |
+| K1771611813937 | Selin - Düz Renk Tülbent Yazma | Fureya - Karışık Renkli 10 Adet Flamlı Pamuk Eşarp |
+| ... (toplam 10 adet) | ... | ... |
+
+**Neden eşleştiremiyoruz:**
+- Sistem 1→1 bakış açısıyla çalışıyor: her kbarcode'u bağımsız olarak bir gönderiyle eşleştirmeye çalışıyor
+- Warehouse'daki "Selin - Düz Renk Tülbent Yazma" ile paketin "Fureya - Karışık Renkli 10 Adet Flamlı Pamuk Eşarp" içeriği tamamen farklı
+- Marka farklı (Selin vs Fureya), ürün adı farklı, SKU farklı — hiçbir eşleştirme stratejisi bunu yakalayamaz
+- Manuel ekip bunu "fiziksel olarak yanyana duruyorlar" bilgisiyle eşleştiriyor, ama bu bilgi dijital veride yok
+
+**Ne yapılabilir:**
+
+1. **Kaynak veri tarafı:** Girilen ekranda "toplu girme" seçeneği gelebilir. Kullanıcı 10 tekli kbarcode'u bir grup olarak işaretleyebilir. Kaynak datada bu kbarcode'ların aynı gönderiyle ilişkili olduğu bir flag/ID ile belirtilebilir (örn: aynı `group_id` altında toplanması).
+
+2. **Pipeline tarafı:** Kaynak veride grup bilgisi varsa, pipeline bu grubu tek bir birim olarak ele alabilir. Gruptaki kbarcode'ların toplam sayısı ile paketin ürün sayısı karşılaştırılır ve toplu eşleştirme yapılır.
+
+3. **Şu anki durum:** Kaynak veride bu grup bilgisi olmadığı sürece, pipeline bu tür eşleştirmeleri yapamaz. Bu bir kod limiti değil, veri limiti.
+
+---
+
+## 12. Manuel Eşleştirmelerde Alternatif/Yanlış Marka Girişi
+
+**Ne oldu:**
+Manuel eşleştirme yapan kullanıcılar, ürünün gerçek markasını bulamadıklarında alternatif veya yakın marka giriyorlar. Bu, kaynak veriyi manipüle ediyor ve otomatik eşleştirmeyi imkansız hale getiriyor.
+
+**Somut örnekler:**
+
+| Kbarcode | Warehouse Marka | Warehouse İçerik | Paket Marka | Paket İçerik |
+|----------|----------------|------------------|-------------|--------------|
+| K1771692216922 | ENQ | 6lı Saç Tebeşiri Saç Boyası Seti | Royal paris | Temporary Hair Chalk - Saç Tebeşiri |
+| K1771618067296 | KTS | 4 Adet 40w Floresan Yatay Led Bant Armatür | Gold ROYAL | 40 Watt 120 Cm Led Bant Armatür |
+
+**Neden eşleştiremiyoruz:**
+- Marka tamamen farklı (ENQ vs Royal paris, KTS vs Gold ROYAL)
+- Ürün içeriği kısmen benzer ama dil/format farklılıkları var (Türkçe vs İngilizce, "6lı Saç Tebeşiri" vs "Temporary Hair Chalk")
+- Size bilgisi yok
+- Görseller de çok benzemeyince AI verification da yakalayamıyor
+- Tüm sinyaller (marka, içerik, size, görsel) negatif veya belirsiz → eşleşme oranı imkansıza yaklaşıyor
+
+**Ne yapılabilir:**
+
+1. **Kaynak veri tarafı:** Manuel giriş ekranında "marka bulunamadı" seçeneği veya alternatif marka alanı eklenmeli. Böylece sistem, girilen markanın kesin mi yoksa tahmini mi olduğunu bilir.
+
+2. **Pipeline tarafı:** Eğer marka "tahmini" olarak işaretlenmişse, marka eşleştirme ağırlığı düşürülebilir ve diğer sinyallere (içerik, görsel, kategori) daha fazla ağırlık verilebilir.
+
+3. **Şu anki durum:** Kaynak veride marka güvenilirlik bilgisi olmadığı sürece, pipeline markayı güvenilir kabul ediyor ve farklı marka = farklı ürün olarak değerlendiriyor. Bu doğru bir davranış — aksi takdirde false positive patlar.
+
+---
+
+## 13. Hermes/Lojistik Statü Kaynaklı Yanlış Pozitifler
+
+**Ne oldu:**
+Bu konu Madde 5'te (Yasaklı Statü + 24 Saat Kuralı) detaylıca açıklandı. Toplam yanlış eşleştirmelerin **%50'den fazlası** bu kategoriden kaynaklanıyor.
+
+Saha ekibi (Burak), lojistik sistemindeki `sağlık_durumu`, `operasyon_durumu`, `işlem_açıklaması` alanlarına bakarak bazı gönderileri eşleştirme dışı bırakıyor. Ancak bu alanlar bizim erişebildiğimiz tablolarda (`delivery_history`) mevcut değil.
+
+**Etki:**
+Bu alan çözülmeden yanlış eşleştirme oranı önemli ölçüde düşürülemez. 170 yasaklı statü + 433 adet 24 saat kuralı = **603 kayıt** potansiyel yanlış pozitif kaynağı.
+
+**Durum:**
+Kaynak tablo erişimi ve event-to-açıklama eşleştirmesi bekliyor. Detaylar Madde 5'te.
+
+---
+
+## 14. Manuel Eşleştirmelerle Başarı Oranı Doğrulaması
+
+**Soru:** Manuel verilen eşleştirmelerle sonucu karşılaştırıp doğru oranlara gidebilir miyiz?
+
+**Mevcut durum:**
+- Manuel eşleştirme ekibinin verileri karşılaştırma kaynağı olarak kullanılıyor
+- Ancak Madde 11 ve 12'de görüldüğü gibi, manuel eşleştirmelerin kendisi de her zaman sağlıklı değil (yanlış marka girişi, fiziksel gözleme dayalı toplu eşleştirme)
+- Manuel ekibin erişebildiği bilgi (fiziksel olarak yanyana durma, lojistik detayları) ile sistemin erişebildiği bilgi (dijital veri, görseller) arasında büyük fark var
+
+**Yapılabilecekler:**
+
+1. **Karşılaştırma metriği tanımı:** "Doğru eşleştirme" tanımının netleştirilmesi gerekiyor. Manuel ekibin fiziksel gözleme dayalı eşleştirmesi ile dijital veri bazlı otomatik eşleştirme aynı kriter seti ile değerlendirilmeli.
+
+2. **Ortak alt küme:** Her iki tarafın da eşleştirebildiği kayıtlar (marka, içerik, SKU tutarlı olan) üzerinden başarı oranı hesaplanabilir. Tutarsız kaynak verili (yanlış marka, toplu eşleştirme) kayıtlar bu hesaplamadan ayrılmalı.
+
+3. **Geri bildirim döngüsü:** `match_verified` mekanizması zaten bunu yapıyor — her test döngüsünde saha ekibinin `yes`/`no` geri bildirimi sisteme giriyor. Kümülatif olarak doğruluk oranı artıyor.
+
+---
+
+## 15. %50 Kuralı ve Toplu Paket Değerlendirme Problemi
+
+**Ne oldu:**
+Bir pakette 5 ürün varsa ve 3 tanesi eşleştirilmişse, 2'si doğru 1'i yanlış olsa bile tüm paket "yanlış" olarak değerlendiriliyor. Bu, başarı oranlarını yapay olarak düşürüyor.
+
+**Somut örnek:**
+
+| Paket (5 ürün) | Eşleşme | Durum |
+|----------------|---------|-------|
+| Kbarcode-1 → IC-A | Doğru | ✅ |
+| Kbarcode-2 → IC-A | Doğru | ✅ |
+| Kbarcode-3 → IC-A | Yanlış | ❌ |
+| Kbarcode-4 | Eşleşmedi | — |
+| Kbarcode-5 | Eşleşmedi | — |
+
+Mevcut değerlendirme: 3 eşleşmeden 1'i yanlış → paket "hatalı" → **5 kayıt yanlış sayılıyor**
+Gerçek durum: 5 kayıttan 2'si doğru, 1'i yanlış, 2'si eşleşmemiş
+
+**Neden sorun:**
+- Başarı oranları olduğundan çok daha kötü görünüyor
+- 1 yanlış eşleşme 5 yanlışa dönüşüyor (5x çarpan etkisi)
+- Büyük paketlerde (10-15 ürün) bu çarpan etkisi daha da artıyor
+- Toplu bakış açısına geçilmediği sürece metrikler yanıltıcı olacak
+
+**Ne yapılabilir:**
+
+1. **Kayıt bazlı değerlendirme:** Her kbarcode bağımsız değerlendirilmeli — doğru eşleşen ayrı, yanlış eşleşen ayrı, eşleşmeyen ayrı sayılmalı. Paket bazlı "hepsi doğru veya hepsi yanlış" mantığından çıkılmalı.
+
+2. **Kısmi başarı metriği:** Bir paket için "3/5 eşleşti, 2/3 doğru" gibi kısmi başarı oranı hesaplanabilir. Bu daha gerçekçi bir resim verir.
+
+3. **Toplu paket değerlendirme:** Madde 11'deki toplu eşleştirme altyapısı geldiğinde, paket bazlı değerlendirme de anlamlı hale gelir. O zamana kadar kayıt bazlı değerlendirme daha doğru sonuç verir.
+
+**Şu anki durum:**
+Bu bir hesaplama/raporlama problemi — pipeline'ın eşleştirme kalitesinden bağımsız. Değerlendirme metriklerinin güncellenmesi gerekiyor.

@@ -221,30 +221,37 @@ Sistem **sırayla** eşleştirme dener, bir ürün eşleştiğinde bir sonraki s
 
 ### Güvenilirlik Matrisi
 
-| Match Rule | Source | Güvenilirlik | Yanlış Eşleşme Riski | Kullanım | Cleanup Gerekli mi? |
-|------------|--------|--------------|----------------------|----------|---------------------|
-| 🔑 SKU + Size | `sku_matching` | %98 | %2 | ✅ Doğrudan kullan | ❌ Hayır |
-| 🔑 SKU + Brand | `sku_matching` | %98 | %2 | ✅ Doğrudan kullan | ❌ Hayır |
-| 🔑 SKU | `sku_matching` | %95 | %5 | ✅ Doğrudan kullan | ✅ Evet (hafif) |
-| 🔗 Link (Trendyol ID) | `link_matching` | %100 | %0 | ✅ Doğrudan kullan | ❌ Hayır |
-| Product + Brand + Size | `exact_matching` | %90 | %10 | ⚠️ Cleanup gerekli | ✅✅ Evet (orta) |
-| Product + Size | `exact_matching` | %85 | %15 | ⚠️ Cleanup gerekli | ✅✅ Evet (yoğun) |
-| Product | `exact_matching` | %75 | %25 | ⚠️ Cleanup gerekli | ✅✅✅ Evet (yoğun) |
-| Fuzzy (≥95%) | `fuzzy_matching` | %85 | %15 | ⚠️ Cleanup gerekli | ✅✅ Evet (orta) |
-| Fuzzy (≥85%) | `fuzzy_matching` | %80 | %20 | ⚠️ Cleanup gerekli | ✅✅✅ Evet (yoğun) |
-| Fuzzy (≥80%) | `fuzzy_matching` | %75 | %25 | ⚠️ Cleanup gerekli | ✅✅✅ Evet (yoğun) |
-| AI (KESIN_AYNI) | `ai_matching` | %100 | %0-1 | ✅ Doğrudan kullan | ✅ Evet (hafif) |
-| AI (AYNI) | `ai_matching` | %90 | %5-10 | ⚠️ Cleanup gerekli | ✅✅ Evet (orta) |
+| Match Rule | Source | Güvenilirlik | Yanlış Eşleşme Riski | Kullanım | Cleanup Muaf mi? |
+|------------|--------|--------------|----------------------|----------|------------------|
+| 🔑 SKU + Size | `sku_matching` | %98 | %2 | ✅ Doğrudan kullan | ✅ MUAF |
+| 🔑 SKU + Brand | `sku_matching` | %98 | %2 | ✅ Doğrudan kullan | ✅ MUAF |
+| 🔑 SKU | `sku_matching` | %95 | %5 | ✅ Doğrudan kullan | ✅ MUAF |
+| 🔗 Link (Trendyol ID) | `link_matching` | %100 | %0 | ✅ Doğrudan kullan | ✅ MUAF |
+| Product + Brand + Size | `exact_matching` | %90 | %10 | ⚠️ Cleanup gerekli | ❌ Cleanup'a girer |
+| Product + Size | `exact_matching` | %85 | %15 | ⚠️ Cleanup gerekli | ❌ Cleanup'a girer |
+| Product | `exact_matching` | %75 | %25 | ⚠️ Cleanup gerekli | ❌ Cleanup'a girer |
+| Fuzzy (≥95%) | `fuzzy_matching` | %85 | %15 | ⚠️ Cleanup gerekli | ❌ Cleanup'a girer |
+| Fuzzy (≥85%) | `fuzzy_matching` | %80 | %20 | ⚠️ Cleanup gerekli | ❌ Cleanup'a girer |
+| Fuzzy (≥80%) | `fuzzy_matching` | %75 | %25 | ⚠️ Cleanup gerekli | ❌ Cleanup'a girer |
+| AI (KESIN_AYNI) | `ai_matching` | %100 | %0-1 | ✅ Doğrudan kullan | ✅ MUAF |
+| AI (AYNI) | `ai_matching` | %90 | %5-10 | ✅ Doğrudan kullan | ✅ MUAF |
 
 ---
 
 ## 🧹 Cleanup Hiyerarşisi
 
-Cleanup işlemleri **tüm source'lara** uygulanır, ancak bazı kurallar bazı source'lar için daha kritik:
+Cleanup, **sadece exact_matching, fuzzy_matching ve AI (FARKLI olmayan)** kaynaklarindan gelen eslestirmelere uygulanir.
 
-### A. Cinsiyet Uyumsuzluğu (Tüm Source'lar)
+**Cleanup'a girmeyen (muaf) kayitlar:**
+- `sku_matching` — SKU tedarikci/uretici kodu, en guvenilir
+- `link_matching` — Trendyol product ID, %100 guvenilir
+- `ai_verification = 'AYNI'` veya `'KESIN_AYNI'` — AI tarafindan dogrulandi
 
-**Kritiklik:** 🔴 ÇOK YÜKSEk (kesinlikle hatalı)
+Bu 3 kategori **hicbir cleanup analyzer'a sokulmaz**.
+
+### A. Cinsiyet Uyumsuzluğu (Exact/Fuzzy)
+
+**Kritiklik:** 🔴 ÇOK YUKSEK (kesinlikle hatalı)
 
 ```sql
 DELETE FROM missing_packages_match
@@ -258,35 +265,39 @@ WHERE kbarcode IN (
 ```
 
 **Hangi Match'leri Etkiler:**
-- ✅ Exact (Product Name) → Çok etkiler
-- ✅ Fuzzy → Çok etkiler
-- ✅ AI → Orta etkiler
-- ❌ Link/SKU → Nadiren etkiler
+- ✅ Exact (Product Name) → Cok etkiler
+- ✅ Fuzzy → Cok etkiler
+- ✅ MUAF: SKU, Link, AI (AYNI/KESIN_AYNI) → Cleanup'a girmez
 
 ---
 
-### B. Kategori Ters Eşleştirme (Tüm Source'lar)
+### B. Kategori Ters Eslestirme (Exact/Fuzzy)
 
-**Kritiklik:** 🔴 ÇOK YÜKSEk (kesinlikle hatalı)
+**Kritiklik:** 🔴 ÇOK YUKSEK (kesinlikle hatalı)
+
+Keyword eslestirmede **word boundary** (`\b...\b`) kullanilir. Baska kelimelerin icinde gecen keywordler tetiklenmez (ornek: "suni" icindeki "un" matchlemez).
 
 ```sql
--- Örnek: Elektronik ↔ Giyim
+-- Ornek: Elektronik <-> Giyim
 DELETE FROM missing_packages_match
 WHERE (kategori_wh = 'Elektronik' AND kategori_pkg = 'Giyim')
-   OR (kategori_wh = 'Giyim' AND kategori_pkg = 'Ayakkabı')
+   OR (kategori_wh = 'Giyim' AND kategori_pkg = 'Ayakkabi')
    ...
 ```
 
 **Hangi Match'leri Etkiler:**
-- ✅ Fuzzy → Çok etkiler (content benzerliği yanıltabilir)
-- ✅ AI → Orta etkiler
-- ❌ Link/SKU → Nadiren etkiler
+- ✅ Exact/Fuzzy → Cok etkiler
+- ✅ MUAF: SKU, Link, AI (AYNI/KESIN_AYNI) → Cleanup'a girmez
 
 ---
 
-### C. Marka-İçerik-Beden Hatası (Exact/Fuzzy)
+### C. Marka-Icerik-Beden Hatasi (Exact/Fuzzy)
 
-**Kritiklik:** 🟠 YÜKSEk
+**Kritiklik:** 🟠 YUKSEK
+
+Brand degeri `bilinmiyor`, `marka bilinmiyor`, `diger`, `diğer` veya `other` iceriyorsa → bu kontrol **atlanir**.
+
+Size karsilastirmasinda normalizasyon uygulanir (`36 - 40` → `36-40`, `S/M` → `S-M`). `STD` ile `TEK EBAT` uyumlu kabul edilir.
 
 ```sql
 DELETE FROM missing_packages_match
@@ -296,24 +307,27 @@ WHERE brand_wh != brand_pkg
 ```
 
 **Hangi Match'leri Etkiler:**
-- ✅ Exact (Product Name) → Çok etkiler
-- ✅ Fuzzy → Çok etkiler
-- ❌ SKU → Nadiren etkiler
+- ✅ Exact (Product Name) → Cok etkiler
+- ✅ Fuzzy → Cok etkiler
+- ✅ MUAF: SKU, Link, AI (AYNI/KESIN_AYNI) → Cleanup'a girmez
 
 ---
 
-### D. İçerik Benzerliği Yok (Fuzzy)
+### D. Icerik Benzerligi Yok (Exact/Fuzzy)
 
 **Kritiklik:** 🟡 ORTA
+
+Sadece sorunlu kayitlar (`NOT_SIMILAR`, `COLOR_MISMATCH`) `analysis_results`'a yazilir. Sorunsuz eslesmeler (`SIMILAR`) kayit edilmez.
 
 ```sql
 DELETE FROM missing_packages_match
 WHERE similarity(product_name_wh, product_name_pkg) < 50%
-  AND source = 'fuzzy_matching'
+  AND source IN ('exact_matching', 'fuzzy_matching')
 ```
 
 **Hangi Match'leri Etkiler:**
-- ✅ Fuzzy → Sadece fuzzy'e özgü
+- ✅ Exact/Fuzzy → Etkiler
+- ✅ MUAF: SKU, Link, AI (AYNI/KESIN_AYNI) → Cleanup'a girmez
 
 ---
 
@@ -410,6 +424,140 @@ ORDER BY
 
 ---
 
+## 🔄 Tam Çalıştırma Sırası (Production Pipeline)
+
+Sistemin uçtan uca çalıştırma sırası ve her adımın görevi:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ADIM 1: AI Görsel Analiz Cache                                         │
+│  POST /ai/analyze-images                                                │
+│                                                                          │
+│  - Warehouse + Package görsellerini AI'a gönderir                       │
+│  - ai_analysis_cache_temp tablosunu doldurur                            │
+│  - Sonraki adımlarda kullanılacak imza verisini hazırlar                │
+│  - Bağımsız çalışır, diğer adımları beklemez                            │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ADIM 2: Ana Eşleştirme Pipeline                                        │
+│  POST /matching/enhanced                                                 │
+│                                                                          │
+│  Sırasıyla:                                                              │
+│  a) missing_packages_match TRUNCATE (temiz başlangıç)                   │
+│  b) Eski quality_filter kayıtlarını analysis_results'tan sil            │
+│  c) match_verified='yes' kbarcode'ları atla (doğrulanmış)              │
+│  d) match_verified='no' çiftlerini engelle (aynı yanlış gelmesin)      │
+│  e) SKU → Link → Exact → Fuzzy eşleştirme                              │
+│  f) Kalite Filtreleri:                                                   │
+│     1. Lokasyon (aynı IC'nin kbarcode'ları aynı lokasyonda mı?)        │
+│     2. Akıllı Tekil (%50 + product_count + match_rule önceliği)        │
+│     3. %50 Product Count (Tekil sonrası gerçek matched_count)          │
+│  g) Filtre elenmeleri → analysis_results'a kaydet                       │
+│  h) missing_packages_match'e kaydet                                      │
+│  i) Historic tabloya kopyala (is_current yönetimi)                      │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ADIM 3: AI Verification                                                 │
+│  POST /ai-verification/fill-missing-verifications?limit=30000           │
+│                                                                          │
+│  - Historic'teki ai_verification=NULL kayıtları bulur                   │
+│  - İki görseli yan yana AI'a gönderip "aynı mı?" sorar                 │
+│  - KESIN_AYNI / AYNI / FARKLI sonucunu yazar                           │
+│  - Batch halinde çalışır (batch_size=50)                                │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ADIM 4: Cleanup (Kalite Kontrol)                                        │
+│  POST /simple-cleanup/clean-historic                                     │
+│                                                                          │
+│  - Historic'teki eşleştirmeleri analiz eder:                            │
+│    · Cinsiyet uyumsuzluğu                                                │
+│    · Kategori ters eşleştirme                                            │
+│    · Marka-içerik-beden hatası                                           │
+│    · İçerik benzerliği düşük                                             │
+│  - Sorunlu kayıtları historic'ten siler                                  │
+│  - Silme nedenlerini analysis_results'a yazar                           │
+│  - SKU/Link/AI(AYNI,KESIN_AYNI) muaf tutulur                           │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│  ADIM 5: Retry (Elenen/Silinen Kbarcode'lar İçin Tekrar Deneme)         │
+│  POST /matching/retry                                                    │
+│                                                                          │
+│  - analysis_results'tan tüm elenen/silinen kbarcode'ları toplar         │
+│    · quality_filter (lokasyon, tekil, %50 elenmeleri)                   │
+│    · cleanup silmeleri (marka, kategori, benzerlik vb.)                  │
+│  - Hâlâ is_current=true eşleşmesi olanları çıkarır                     │
+│  - Eski yanlış çiftleri engeller (rejected pairs):                      │
+│    · analysis_results'taki tüm (kbarcode, IC) çiftleri                  │
+│    · match_verified='no' çiftleri                                        │
+│  - Kalan kbarcode'lar için aynı pipeline'ı çalıştırır:                  │
+│    · SKU → Link → Exact → Fuzzy                                         │
+│    · Aynı 3 kalite filtresi (lokasyon, tekil, %50)                      │
+│  - Yeni eşleştirmeleri incremental olarak historic'e ekler              │
+│    · Mevcut is_current=true kayıtlara DOKUNMAZ                          │
+│    · Sadece yeni retry sonuçlarını ekler                                 │
+│  - Başarılı retry'ların eski filtre kayıtlarını temizler                │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### Veri Akışı Özeti
+
+```
+                    Warehouse (BigQuery)     Package (BigQuery)
+                           │                        │
+                           ▼                        ▼
+                    ┌──────────────────────────────────┐
+                    │    ADIM 2: Enhanced Pipeline      │
+                    │  SKU → Link → Exact → Fuzzy      │
+                    └──────────┬───────────────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    ▼                     ▼
+            Geçen eşleşmeler      Elenen kbarcode'lar
+                    │                     │
+                    ▼                     ▼
+            ┌──────────────┐    ┌──────────────────┐
+            │   Historic   │    │ analysis_results │
+            │ (is_current) │    │ (quality_filter) │
+            └──────┬───────┘    └────────┬─────────┘
+                   │                     │
+            ┌──────┴───────┐             │
+            ▼              ▼             │
+    ADIM 3: AI      ADIM 4: Cleanup     │
+    Verification    (silinen → a.r.)     │
+                           │             │
+                           ▼             ▼
+                    ┌──────────────────────────┐
+                    │    ADIM 5: Retry          │
+                    │  (a.r.'dan kbarcode al,  │
+                    │   yeniden eşleştir)       │
+                    └──────────┬───────────────┘
+                               │
+                        ┌──────┴──────┐
+                        ▼             ▼
+                 Yeni eşleşme   Eşleşemedi
+                 → Historic'e   (kayıp kalır)
+                 incremental
+```
+
+### Retry Mekanizması Detayı
+
+Retry'ın ana pipeline'dan farklılıkları:
+
+| Özellik | Ana Pipeline (enhanced) | Retry |
+|---------|------------------------|-------|
+| Hangi kbarcode'lar? | Tüm warehouse | Sadece analysis_results'takiler |
+| Historic yazma | Full reset (is_current=false → true) | Incremental (mevcut kayıtlara dokunmaz) |
+| quality_filter temizliği | Başta tümünü siler | Sadece başarılı retry'larınkini siler |
+| Rejected pairs | match_verified='no' çiftleri | a.r.'daki tüm çiftler + match_verified='no' |
+| Kalite filtreleri | Aynı 3 filtre | Aynı 3 filtre |
+| Sonuç source | sku/link/exact/fuzzy_matching | retry_matching |
+
+---
+
 ## 🚀 Sonuç
 
 **Hiyerarşi Mantığı:**
@@ -420,7 +568,8 @@ ORDER BY
 4. **🎯 Fuzzy** → Benzerlik bazlı eşleştirme
 5. **🤖 AI** → Görsel analiz ile eşleştirme
 6. **🧹 Cleanup** → Yanlış eşleştirmeleri temizle
-7. **📚 Historic** → Geçmişi koru
+7. **🔄 Retry** → Elenen/silinen kbarcode'lara ikinci şans
+8. **📚 Historic** → Geçmişi koru
 
 **Güvenilirlik İlkesi (YENİ SIRALAMA):**
 
