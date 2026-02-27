@@ -490,3 +490,87 @@ Gerçek durum: 5 kayıttan 2'si doğru, 1'i yanlış, 2'si eşleşmemiş
 
 **Şu anki durum:**
 Bu bir hesaplama/raporlama problemi — pipeline'ın eşleştirme kalitesinden bağımsız. Değerlendirme metriklerinin güncellenmesi gerekiyor.
+
+---
+
+## 16. AI Görsel Analiz Performansı ve Veri Harmanlaması (TO-DO)
+
+> **Öncelik notu:** Bu madde, Madde 11 (toplu paket) ve Madde 12 (kaynak veri kalitesi) çözüldükten **sonra** ele alınmalı. Kaynak veri sorunları düzelmeden AI tarafına yatırım yapmak verimsiz olur.
+
+**Mevcut durum:**
+`ai_analysis_cache_temp` tablosunda her görselin detaylı AI analizi tutuluyor: kategori, tip, alt_tip, marka, renk, desen, malzeme, stil, cinsiyet, boyut, hacim, adet, logo, baskı, doku ve onlarca kategori-özel alan. Bu veriler şu anda sadece AI signature matching (imza karşılaştırma) için kullanılıyor ama pipeline'daki diğer eşleştirme adımlarıyla harmanlanmıyor.
+
+**Sorun:**
+AI aynı ürünü farklı ortamlarda farklı yorumluyor. Katalog görseli ile depo görseli arasında tutarsızlıklar oluşuyor:
+
+**Örnek 1 — Altınyıldız Classics parfüm (aynı ürün, 2 farklı görsel):**
+
+- Katalog: https://cdn.dsmcdn.com//ty1000042/product/media/images/prod/PIM/20251215/14/15127cec-884f-4ac9-aa04-aadc49d116c3/1_org.jpg
+- Depo: https://s3.trendyol.com/hs-return-packages/2026/2/23/b3c61e41-7501-4dd5-aeca-0e07842839b5.png
+
+| Alan | Katalog Görseli (Trendyol) | Depo Görseli (Kamera) |
+|------|---------------------------|----------------------|
+| renk | koyu mavi, açık mavi, altın | siyah |
+| malzeme | cam, metal, karton | karton |
+| logo | yazılı marka + geometrik logo | yazılı marka + yıldız logosu |
+| ambalaj | şişe | kutu |
+
+Marka, kategori, tip, hacim aynı — ama renk, malzeme, ambalaj farklı çıkıyor. İmza karşılaştırması bu farklardan dolayı düşük skor veriyor.
+
+**Örnek 2 — Mavi bluz (aynı ürün, katalog vs depo):**
+
+- Katalog: https://cdn.dsmcdn.com//ty1826/prod/QC_PREP/20260211/14/e71bfcb7-8d67-324e-b5ce-511123d01414/1_org.jpg
+- Depo: https://s3.trendyol.com/hs-return-packages/2026/2/21/287a42bf-ed4b-4348-bedc-eaa2c60625ad.png
+
+| Alan | Katalog Görseli | Depo Görseli |
+|------|----------------|-------------|
+| tip | bluz | üst |
+| alt_tip | kolsuz bluz | (yok) |
+| cinsiyet | kadın | (belirsiz) |
+| boyut | (yok) | M |
+| yuz_doku | tamamen düz | dalgalı |
+| dekor | drape | sade |
+| giyim_kesim | dar | (yok) |
+| yaka_tipi | boğazlı | (yok) |
+
+Katalog görselinde model giyer halde, arka plan temiz, kıyafet net görünüyor — AI detaylı analiz yapabiliyor (kolsuz, boğazlı, dar kesim). Depo görselinde ürün elle tutulmuş, buruşuk, etiket asılı, arka planda depo rafları var — AI sadece "mavi üst giyim" diyebiliyor. Aynı bluz ama AI çıktıları çok farklı.
+
+> **Bu örneklerin gösterdiği:** Sadece görselden eşleştirme yapmaya çalışmak çok zor — depo ortamı görselleri bozuyor, AI tutarsız sonuçlar veriyor. **Var olan data ile (SKU, marka, içerik, size) AI verisini harmanlamak** çok daha sağlıklı sonuç verir. Görseli tek başına değil, diğer sinyallerle birlikte destekleyici olarak kullanmak gerekiyor. Bu alan üzerinde çalışılması gerekiyor.
+
+**Örnek 2 — Depo görseli birden fazla ürün içeriyor:**
+Tek bir depo fotoğrafında hem mavi bluz hem koyu mavi kot pantolon var. AI ikisini ayrı analiz edemiyor, sadece birini (bluz) algılıyor ve sonucu ona göre veriyor. Diğer ürün (pantolon) tamamen kayıp.
+
+**Yapılabilecekler (TO-DO):**
+
+### a) AI cache verisini pipeline'a entegre etme
+Mevcut eşleştirme adımlarında (Exact, Fuzzy) sadece text bazlı alanlar (product_content_name, brand_name, size) kullanılıyor. AI cache'teki ek alanlar (kategori, tip, cinsiyet, malzeme, renk) eşleştirme skorlamasına dahil edilebilir:
+- Fuzzy matching'de marka eşleşmezse ama AI cache'te her iki görselin `kategori + tip + cinsiyet` aynıysa → ek sinyal olarak kullanılabilir
+- İçerik threshold'un altında kalan eşleşmelerde AI verileri tiebreaker olabilir
+
+### b) AI signature tutarlılığı
+Farklı ortamlardan gelen görsellerde tutarsız sonuçlar azaltılabilir:
+- Prompt'a "ürünün kendisine odaklan, ambalaj/ortam bilgisini ayrı tut" gibi yönlendirmeler
+- Renk ve malzeme gibi ortamdan çok etkilenen alanların karşılaştırma ağırlığını düşürme
+- Marka, kategori, tip gibi ortamdan bağımsız alanların ağırlığını artırma
+
+### c) Multi-signal karar mekanizması
+Tek bir eşleştirme stratejisine güvenmek yerine, birden fazla sinyali birlikte değerlendirme:
+
+| Sinyal | Kaynak | Güvenilirlik |
+|--------|--------|-------------|
+| SKU eşleşmesi | Veri tabanı | Çok yüksek |
+| Marka eşleşmesi | Text | Yüksek |
+| İçerik benzerliği | Text (fuzzy) | Orta |
+| AI kategori/tip | Görsel analiz | Orta |
+| AI verification | Görsel karşılaştırma | Yüksek (ama maliyetli) |
+
+Birden fazla sinyal pozitifse (ör: marka aynı + AI kategori aynı + içerik %65+) → threshold altında kalsa bile eşleştirme kabul edilebilir.
+
+### d) Çoklu ürün tespiti
+Depo görsellerinde birden fazla ürün olduğunda AI sadece birini algılıyor. Bu durumda:
+- Görselde kaç ürün olduğunu tespit etme (object detection)
+- Her ürün için ayrı analiz yapma
+- Bu, Madde 11'deki toplu paket problemiyle de bağlantılı
+
+**Şu anki durum:**
+AI altyapısı çalışıyor, cache tablosu dolu, veriler mevcut. Ancak **önce kaynak veri sorunları (Madde 11: toplu paket girişi, Madde 12: marka güvenilirliği) çözülmeli.** Kaynak veri temiz olduğunda, AI verisini pipeline'a entegre etmek çok daha anlamlı ve ölçülebilir sonuçlar verir. Aksi takdirde AI iyileştirmeleri kirli verinin üstüne yapılmış olur ve gerçek etkisi ölçülemez.
