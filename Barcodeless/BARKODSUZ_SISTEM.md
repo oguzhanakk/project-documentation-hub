@@ -771,6 +771,95 @@ ADIM 6: AI Final Matching
 
 ---
 
+## 🔬 Hedeflenen ve Paralelde Test Edilenler
+
+Mevcut sistemde görsel eşleştirme, Trendyol AI API'ye görsel ve ürün metadatası birlikte gönderilerek yapılmaktadır. Bu yaklaşım işlevsel olmakla birlikte, API bağımlılığı ve yanıt süresi nedeniyle bazı kısıtlar içermektedir. Bu kısıtları aşmak amacıyla görsel ve metadatayı **ayrı kanallardan** işleyip birleştiren bir yaklaşım paralelde test edilmektedir.
+
+---
+
+### 🎯 Hedef: Görsel + Metadata Birleşik Eşleştirme Servisi
+
+Mevcut akışta görsel ve metadata tek bir API çağrısında birleştirilerek gönderilir; eşleştirme kararı tamamen API yanıtına dayanır. Hedeflenen yaklaşımda her iki sinyal bağımsız işlenip ağırlıklı olarak birleştirilmektedir:
+
+```
+Mevcut Akış:
+  Depo görseli + Metadata
+       │
+       ▼
+  Trendyol AI API  →  Tek bir karar (AYNI / FARKLI)
+       │
+       ▼
+  Eşleşme sonucu
+
+Hedeflenen Akış:
+  Depo görseli              Depo + Paket metadatası
+       │                    (marka, ürün adı, beden)
+       ▼                            ▼
+  Görsel embedding          Text/feature embedding
+  (CLIP / ViT)              (yerel model)
+       │                            │
+       └──────────┬─────────────────┘
+                  ▼
+         Birleşik benzerlik skoru
+                  │
+                  ▼
+         Eşleşme adayları (API bağımsız)
+```
+
+Bu yapının temel avantajı: görsel benzerlik yüksek ama metadata uyumsuzsa (ya da tam tersi) her iki sinyali **ayrı ayrı ağırlıklandırarak** değerlendirmek. Mevcut sistemde bu ayrım API'nin iç kararına bırakılmaktadır; hedeflenen yapıda kontrol tamamen pipeline içinde olacaktır.
+
+---
+
+### 🧪 Aktif Test Edilen Bileşenler
+
+#### 1. Görüntü Ön İşleme
+
+Depo fotoğrafları profesyonel stüdyo çekimleriyle karşılaştırıldığında arka plan, ışık ve açı açısından önemli farklılıklar içermektedir. Embedding modellerine vermeden önce görselleri normalize etmek için aşağıdaki yöntemler test edilmektedir:
+
+- **OpenCV** — depo ve katalog görsellerini aynı boyuta getirme (resize), gri tonlama ve kontrast normalizasyonu test edildi. Şu an farklı ışık koşullarında histogram eşitleme ile domain farkının embedding kalitesine etkisi inceleniyor.
+
+- **Pillow (PIL)** — URL'den görsel indirip belleğe alma, format dönüşümü (JPEG/PNG/WebP) ve temel kırpma işlemleri çalışıyor. Katalog vs depo görsellerinde boyut ve oran farkının embedding öncesi nasıl standartlaştırılacağına bakılıyor.
+
+- **rembg** — arka plan silme prototip olarak denendi; depo fotoğraflarındaki raf/kutu gürültüsünü temizlemede etkili olmakla birlikte işlem süresi (görsel başına ~0.3–0.5 sn) servis mimarisine uygunluk açısından değerlendiriliyor.
+
+#### 2. Görsel + Metin Embedding
+
+Görseli ve metadatayı aynı vektör uzayında temsil etmek için vision-language modeller değerlendirilmektedir:
+
+- **CLIP (OpenAI)** — görsel ve metin embedding'lerini ortak uzayda üretir; "siyah deri ceket" metniyle görsel arama senaryosunu da kapsar
+- **ViT (Vision Transformer)** — sınıflandırma odaklı görsel embedding üretimi
+
+Bu modeller özellikle depo kaydındaki dağınık metin ile katalog görselini aynı uzayda karşılaştırabilmek için ilgi çekicidir.
+
+#### 3. Vektör Benzerlik Arama
+
+Paket görsellerinin ve metin embedding'lerinin saklandığı, anlık sorgu yapılabildiği bir indeks altyapısı için **FAISS** (Facebook AI Similarity Search) test edilmektedir. Hedef: API çağrısı olmadan saniyeler içinde en yakın K adayı döndürmek.
+
+---
+
+### 🔁 Servis Mimarisine Geçiş Hedefi
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  HEDEFLENEN BİRLEŞİK EŞLEŞTIRME SERVİSİ                     │
+│                                                              │
+│  Girdi: Depo görseli (URL) + Depo/Paket metadata             │
+│                                                              │
+│  1. Görüntü ön işleme (normalize, arka plan temizle)         │
+│  2. Görsel embedding → vektör                                │
+│  3. Metadata embedding → vektör (marka, ürün adı, beden)    │
+│  4. FAISS üzerinde K-NN arama (görsel + metadata ağırlıklı)  │
+│  5. Birleşik skor → eşleşme adayları                         │
+│                                                              │
+│  Çıktı: [(integration_code, skor, karar), ...]               │
+│  Süre hedefi: < 1 saniye / sorgu                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Bu servis, mevcut pipeline'da **Adım 5 (AI Görsel Matching)** adımının yerini alacak şekilde tasarlanmaktadır. Görsel ile metadatayı ayrı kanallardan işleyip birleştirmesi, sadece API kararına bağlı kalmaktan daha sağlam ve denetlenebilir bir eşleştirme sinyali üretmeyi hedeflemektedir.
+
+---
+
 ## 📊 Gerçek Veri Metrikleri (Örnek Run)
 
 ### Eşleştirme Dağılımı
